@@ -131,6 +131,7 @@ py_test(
 py_library(
     name = "model_utils",
     srcs = ["model_utils.py"],
+    visibility = ["//visibility:public"],
     deps = [
         ":model",
         "//tensorflow_federated/python/common_libs:anonymous_tuple",
