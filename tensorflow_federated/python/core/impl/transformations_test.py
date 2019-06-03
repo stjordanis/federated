@@ -2752,5 +2752,330 @@ class ParseTFFToTFTest(absltest.TestCase):
     self.assertEqual(exec_lambda(17), exec_tf(17))
 
 
+def _count_intrinsic(comp, uri):
+  count = [0]
+
+  def _transform(comp):
+    if isinstance(comp,
+                  computation_building_blocks.Intrinsic) and comp.uri == uri:
+      count[0] += 1
+    return comp, False
+
+  transformation_utils.transform_postorder(comp, _transform)
+  return count[0]
+
+
+def _are_federated_types_under(comp):
+  federated_under = [False]
+
+  def _transform(comp):
+    if isinstance(comp.type_signature, computation_types.FederatedType):
+      federated_under[0] = True
+    return comp, False
+
+  transformation_utils.transform_postorder(comp, _transform)
+  return federated_under[0]
+
+
+class UnwrapPlacementTest(parameterized.TestCase):
+
+  def test_raises_on_none(self):
+    with self.assertRaises(TypeError):
+      transformations.unwrap_placement(None)
+
+  def test_raises_computation_non_federated_type(self):
+    with self.assertRaises(TypeError):
+      transformations.unwrap_placement(
+          computation_building_blocks.Data('x', tf.int32))
+
+  def test_raises_unbound_reference_non_federated_type(self):
+    block = computation_building_blocks.Block(
+        [('x', computation_building_blocks.Reference('y', tf.int32))],
+        computation_building_blocks.Reference(
+            'x', computation_types.FederatedType(tf.int32, placements.CLIENTS)))
+    with self.assertRaisesRegex(TypeError, 'lone unbound reference'):
+      transformations.unwrap_placement(block)
+
+  def test_raises_two_unbound_references(self):
+    ref_to_x = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    ref_to_y = computation_building_blocks.Reference(
+        'y', computation_types.FunctionType(tf.int32, tf.float32))
+    applied = computation_constructing_utils.create_federated_apply(
+        ref_to_y, ref_to_x)
+    with self.assertRaises(ValueError):
+      transformations.unwrap_placement(applied)
+
+  def test_raises_disallowed_intrinsic(self):
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    broadcaster = computation_building_blocks.Intrinsic(
+        intrinsic_defs.FEDERATED_BROADCAST.uri,
+        computation_types.FunctionType(
+            fed_ref.type_signature,
+            computation_types.FederatedType(
+                fed_ref.type_signature.member,
+                placements.CLIENTS,
+                all_equal=True)))
+    called_broadcast = computation_building_blocks.Call(broadcaster, fed_ref)
+    with self.assertRaises(ValueError):
+      transformations.unwrap_placement(called_broadcast)
+
+  def test_passes_unbound_type_signature_obscured_under_block(self):
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    block = computation_building_blocks.Block(
+        [('y', fed_ref),
+         ('x', computation_building_blocks.Data('dummy', tf.int32)),
+         ('z', computation_building_blocks.Reference('x', tf.int32))],
+        computation_building_blocks.Reference('y', fed_ref.type_signature))
+    transformations.unwrap_placement(block)
+
+  def test_removes_federated_types_under_function(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+    self.assertEqual(placement_unwrapped.function.uri,
+                     intrinsic_defs.FEDERATED_APPLY.uri)
+    self.assertFalse(
+        _are_federated_types_under(placement_unwrapped.argument[0]))
+
+  def test_unwrap_placement_removes_one_federated_apply(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+
+    self.assertEqual(
+        second_applied_id.tff_repr,
+        'federated_apply(<(x -> x),federated_apply(<(x -> x),x>)>)')
+    self.assertEqual(
+        _count_intrinsic(second_applied_id, intrinsic_defs.FEDERATED_APPLY.uri),
+        2)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped,
+                         intrinsic_defs.FEDERATED_APPLY.uri), 1)
+    self.assertEqual(placement_unwrapped.type_signature,
+                     second_applied_id.type_signature)
+    self.assertIsInstance(placement_unwrapped, computation_building_blocks.Call)
+    self.assertIsInstance(placement_unwrapped.argument[0],
+                          computation_building_blocks.Lambda)
+    self.assertIsInstance(placement_unwrapped.argument[0].result,
+                          computation_building_blocks.Call)
+    self.assertEqual(placement_unwrapped.argument[0].result.function.tff_repr,
+                     '(_var1 -> _var1[0](_var1[1]))')
+    self.assertEqual(
+        placement_unwrapped.argument[0].result.argument[0].tff_repr, '(x -> x)')
+    self.assertEqual(
+        placement_unwrapped.argument[0].result.argument[1].tff_repr,
+        '(_var2 -> _var2[0](_var2[1]))(<(x -> x),x>)')
+
+  def test_unwrap_placement_with_federated_apply_executes_correctly(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+    lambda_wrapping_id = computation_building_blocks.Lambda(
+        'x', fed_ref.type_signature, second_applied_id)
+    lambda_wrapping_placement_unwrapped = computation_building_blocks.Lambda(
+        'x', fed_ref.type_signature, placement_unwrapped)
+    executable_identity = _to_computation_impl(lambda_wrapping_id)
+    executable_unwrapped = _to_computation_impl(
+        lambda_wrapping_placement_unwrapped)
+
+    for k in range(10):
+      self.assertEqual(executable_identity(k), executable_unwrapped(k))
+
+  def test_unwrap_placement_removes_two_federated_applys(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.SERVER))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    third_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, second_applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+
+    self.assertEqual(
+        _count_intrinsic(third_applied_id, intrinsic_defs.FEDERATED_APPLY.uri),
+        3)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped,
+                         intrinsic_defs.FEDERATED_APPLY.uri), 1)
+
+  def test_unwrap_placement_removes_one_federated_map(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.CLIENTS))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+
+    self.assertEqual(second_applied_id.tff_repr,
+                     'federated_map(<(x -> x),federated_map(<(x -> x),x>)>)')
+    self.assertEqual(
+        _count_intrinsic(second_applied_id, intrinsic_defs.FEDERATED_MAP.uri),
+        2)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped, intrinsic_defs.FEDERATED_MAP.uri),
+        1)
+    self.assertEqual(placement_unwrapped.type_signature,
+                     second_applied_id.type_signature)
+    self.assertIsInstance(placement_unwrapped, computation_building_blocks.Call)
+    self.assertIsInstance(placement_unwrapped.argument[0],
+                          computation_building_blocks.Lambda)
+    self.assertIsInstance(placement_unwrapped.argument[0].result,
+                          computation_building_blocks.Call)
+    self.assertEqual(placement_unwrapped.argument[0].result.function.tff_repr,
+                     '(_var1 -> _var1[0](_var1[1]))')
+    self.assertEqual(
+        placement_unwrapped.argument[0].result.argument[0].tff_repr, '(x -> x)')
+    self.assertEqual(
+        placement_unwrapped.argument[0].result.argument[1].tff_repr,
+        '(_var2 -> _var2[0](_var2[1]))(<(x -> x),x>)')
+
+  def test_unwrap_placement_with_federated_map_executes_correctly(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.CLIENTS))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    placement_unwrapped = transformations.unwrap_placement(second_applied_id)
+    lambda_wrapping_id = computation_building_blocks.Lambda(
+        'x', fed_ref.type_signature, second_applied_id)
+    lambda_wrapping_placement_unwrapped = computation_building_blocks.Lambda(
+        'x', fed_ref.type_signature, placement_unwrapped)
+    executable_identity = _to_computation_impl(lambda_wrapping_id)
+    executable_unwrapped = _to_computation_impl(
+        lambda_wrapping_placement_unwrapped)
+
+    for k in range(10):
+      self.assertEqual(executable_identity([k]), executable_unwrapped([k]))
+
+  def test_unwrap_placement_removes_two_federated_maps(self):
+    int_ref = computation_building_blocks.Reference('x', tf.int32)
+    int_id = computation_building_blocks.Lambda('x', tf.int32, int_ref)
+    fed_ref = computation_building_blocks.Reference(
+        'x', computation_types.FederatedType(tf.int32, placements.CLIENTS))
+    applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, fed_ref)
+    second_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, applied_id)
+    third_applied_id = computation_constructing_utils.create_federated_map_or_apply(
+        int_id, second_applied_id)
+    placement_unwrapped = transformations.unwrap_placement(third_applied_id)
+
+    self.assertEqual(
+        _count_intrinsic(third_applied_id, intrinsic_defs.FEDERATED_MAP.uri), 3)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped, intrinsic_defs.FEDERATED_MAP.uri),
+        1)
+
+  def test_unwrap_removes_all_federated_zips_at_server(self):
+    fed_tuple = computation_building_blocks.Reference(
+        'tup',
+        computation_types.FederatedType([tf.int32, tf.float32] * 2,
+                                        placements.SERVER))
+    unzipped = computation_constructing_utils.create_federated_unzip(fed_tuple)
+    zipped = computation_constructing_utils.create_federated_zip(unzipped)
+    placement_unwrapped = transformations.unwrap_placement(zipped)
+
+    self.assertIsInstance(zipped.type_signature,
+                          computation_types.FederatedType)
+    self.assertEqual(
+        _count_intrinsic(zipped, intrinsic_defs.FEDERATED_ZIP_AT_SERVER.uri), 3)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped,
+                         intrinsic_defs.FEDERATED_ZIP_AT_SERVER.uri), 0)
+
+  def test_unwrap_placement_with_federated_zip_at_server_executes_correctly(
+      self):
+    fed_tuple = computation_building_blocks.Reference(
+        'tup',
+        computation_types.FederatedType([tf.int32, tf.float32] * 2,
+                                        placements.SERVER))
+    unzipped = computation_constructing_utils.create_federated_unzip(fed_tuple)
+    zipped = computation_constructing_utils.create_federated_zip(unzipped)
+    placement_unwrapped = transformations.unwrap_placement(zipped)
+
+    lambda_wrapping_zip = computation_building_blocks.Lambda(
+        'tup', fed_tuple.type_signature, zipped)
+    lambda_wrapping_placement_unwrapped = computation_building_blocks.Lambda(
+        'tup', fed_tuple.type_signature, placement_unwrapped)
+    executable_zip = _to_computation_impl(lambda_wrapping_zip)
+    executable_unwrapped = _to_computation_impl(
+        lambda_wrapping_placement_unwrapped)
+
+    for k in range(10):
+      self.assertEqual(
+          executable_zip([k, k * 1., k, k * 1.]),
+          executable_unwrapped([k, k * 1., k, k * 1.]))
+
+  def test_unwrap_removes_all_federated_zips_at_clients(self):
+    fed_tuple = computation_building_blocks.Reference(
+        'tup',
+        computation_types.FederatedType([tf.int32, tf.float32] * 2,
+                                        placements.CLIENTS))
+    unzipped = computation_constructing_utils.create_federated_unzip(fed_tuple)
+    zipped = computation_constructing_utils.create_federated_zip(unzipped)
+    placement_unwrapped = transformations.unwrap_placement(zipped)
+
+    self.assertIsInstance(zipped.type_signature,
+                          computation_types.FederatedType)
+    self.assertEqual(
+        _count_intrinsic(zipped, intrinsic_defs.FEDERATED_ZIP_AT_CLIENTS.uri),
+        3)
+    self.assertEqual(
+        _count_intrinsic(placement_unwrapped,
+                         intrinsic_defs.FEDERATED_ZIP_AT_CLIENTS.uri), 0)
+
+  def test_unwrap_placement_with_federated_zip_at_clients_executes_correctly(
+      self):
+    fed_tuple = computation_building_blocks.Reference(
+        'tup',
+        computation_types.FederatedType([tf.int32, tf.float32] * 2,
+                                        placements.CLIENTS))
+    unzipped = computation_constructing_utils.create_federated_unzip(fed_tuple)
+    zipped = computation_constructing_utils.create_federated_zip(unzipped)
+    placement_unwrapped = transformations.unwrap_placement(zipped)
+    lambda_wrapping_zip = computation_building_blocks.Lambda(
+        'tup', fed_tuple.type_signature, zipped)
+    lambda_wrapping_placement_unwrapped = computation_building_blocks.Lambda(
+        'tup', fed_tuple.type_signature, placement_unwrapped)
+    executable_zip = _to_computation_impl(lambda_wrapping_zip)
+    executable_unwrapped = _to_computation_impl(
+        lambda_wrapping_placement_unwrapped)
+
+    for k in range(10):
+      self.assertEqual(
+          executable_zip([[k, k * 1., k, k * 1.]]),
+          executable_unwrapped([[k, k * 1., k, k * 1.]]))
+
+
 if __name__ == '__main__':
   absltest.main()

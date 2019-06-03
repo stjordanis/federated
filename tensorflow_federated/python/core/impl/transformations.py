@@ -33,6 +33,7 @@ from tensorflow_federated.python.core.impl import context_stack_base
 from tensorflow_federated.python.core.impl import federated_computation_utils
 from tensorflow_federated.python.core.impl import intrinsic_defs
 from tensorflow_federated.python.core.impl import transformation_utils
+from tensorflow_federated.python.core.impl import type_utils
 
 
 def extract_intrinsics(comp):
@@ -1122,6 +1123,168 @@ class TFParser(object):
         transformed, ind = option.transform(comp)
         return transformed, ind
     return comp, False
+
+
+def unwrap_placement(comp):
+  """Strips the placement under `comp`, returning a single call to map or apply.
+
+  Assumes that all processing under `comp` is happening on a single device.
+
+  The other assumptions on inputs of `unwrap_placement` are enumerated as
+  follows:
+
+  1. There is exactly one unbound reference under `comp`, which is of federated
+     type. Otherwise we won't be able to pack this into a single call to map
+     or apply.
+  2. The only intrinsics present here are apply/map, depending on the
+     placement, and zip.
+  3. The type signature of `comp` itself is federated.
+  4. There are no federated instances of `computation_building_blocks.Data`
+     constructs under `comp`; how these would be handled by a function such as
+     this is not entirely clear.
+
+  Under these conditions, `unwrap_placement` will produce a single called
+  federated map or apply, depending on the placement present in `comp`, with
+  the function being applied containing the main logic for `comp`. Other than
+  this single map or apply, no intrinsics will remain under `comp`.
+
+  Args:
+    comp: Instance of `computation_building_blocks.ComputationBuildingBlock`
+      satisfying the assumptions above.
+
+  Returns:
+    A modified version of `comp`, whose root is a single called
+    federated map or apply, and containing no other intrinsics. Equivalent
+    to `comp`. Notice that `unwrap_placement`, if it succeeds, will always
+    modify `comp`.
+
+  Raises:
+    TypeError: If the lone unbound reference under `comp` is not of federated
+    type, `comp` itself is not of federated type, or `comp` is not a building
+    block.
+    ValueError: If we encounter a placement other than the one declared by
+    `comp.type_signature`, an intrinsic not present in the whitelist above, or
+    `comp` contains more than one unbound reference.
+  """
+  py_typecheck.check_type(comp,
+                          computation_building_blocks.ComputationBuildingBlock)
+  py_typecheck.check_type(comp.type_signature, computation_types.FederatedType)
+  name_gen = computation_constructing_utils.unique_name_generator(comp)
+  single_placement = comp.type_signature.placement
+
+  def _check_single_placement(type_spec):
+    """Checks that the placement in `type_spec` matches `single_placement`."""
+    if (isinstance(type_spec, computation_types.FederatedType) and
+        type_spec.placement != single_placement):
+      raise ValueError(
+          'Before we call `unwrap_placement`, all processing must have been '
+          'consolidated onto a single device. In this case, the top-level '
+          'comp declared its placement to be at {}, but we have encountered '
+          'placement {} inside the structure. ').format(single_placement,
+                                                        type_spec.placement)
+    return type_spec, False
+
+  type_utils.transform_type_postorder(comp.type_signature,
+                                      _check_single_placement)
+
+  all_unbound_references = _get_unbound_references(comp)
+  root_unbound_references = all_unbound_references[comp]
+
+  if len(root_unbound_references) != 1:
+    raise ValueError(
+        '`unwrap_placement` can only handle computations with a single unbound '
+        'reference; you have passed in the computation {} with {} unbound '
+        'references.'.format(comp.tff_repr, len(root_unbound_references)))
+
+  unbound_reference_name = root_unbound_references.pop()
+  unbound_reference_type_container = [None]
+
+  def _remove_reference_placement(comp, symbol_tree):
+    """Unwraps placement from references and updates unbound reference info."""
+
+    def _remove_placement_from_type(type_spec):
+      if isinstance(type_spec, computation_types.FederatedType):
+        return type_spec.member, True
+      else:
+        return type_spec, False
+
+    new_type, _ = type_utils.transform_type_postorder(
+        comp.type_signature, _remove_placement_from_type)
+    if comp.name == unbound_reference_name and symbol_tree.get_payload_with_name(
+        comp.name).unbound:
+      unbound_reference_type_container[0] = comp.type_signature
+    return computation_building_blocks.Reference(comp.name, new_type)
+
+  def _replace_intrinsics_with_functions(comp):
+    """Helper to remove intrinsics from the AST."""
+    if (comp.uri == intrinsic_defs.FEDERATED_ZIP_AT_SERVER.uri or
+        comp.uri == intrinsic_defs.FEDERATED_ZIP_AT_CLIENTS.uri):
+      arg_name = six.next(name_gen)
+      arg_type = comp.type_signature.result.member
+      val = computation_building_blocks.Reference(arg_name, arg_type)
+      lam = computation_building_blocks.Lambda(arg_name, arg_type, val)
+      return lam
+    elif comp.uri not in (intrinsic_defs.FEDERATED_MAP.uri,
+                          intrinsic_defs.FEDERATED_APPLY.uri):
+      raise ValueError('Disallowed intrinsic: {}'.format(comp))
+    arg_name = six.next(name_gen)
+    tuple_ref = computation_building_blocks.Reference(arg_name, [
+        comp.type_signature.parameter[0],
+        comp.type_signature.parameter[1].member
+    ])
+    fn = computation_building_blocks.Selection(tuple_ref, index=0)
+    arg = computation_building_blocks.Selection(tuple_ref, index=1)
+    called_fn = computation_building_blocks.Call(fn, arg)
+    return computation_building_blocks.Lambda(arg_name,
+                                              tuple_ref.type_signature,
+                                              called_fn)
+
+  def _transform(comp, symbol_tree):
+    if isinstance(comp, computation_building_blocks.Reference):
+      return _remove_reference_placement(comp, symbol_tree), True
+    elif isinstance(comp, computation_building_blocks.Intrinsic):
+      return _replace_intrinsics_with_functions(comp), True
+    return comp, False
+
+  class _UnboundVariableIdentifier(transformation_utils.BoundVariableTracker):
+    """transformation_utils.SymbolTree node for tracking unbound variables."""
+
+    def __init__(self, name, value):
+      super(_UnboundVariableIdentifier, self).__init__(name, value)
+      self.unbound = False
+
+    def __str__(self):
+      return 'Value: {}, name: {}, new_name: {}'.format(self.value, self.name,
+                                                        self.new_name)
+
+    def update(self, sth):
+      self.unbound = True
+
+  symbol_tree = transformation_utils.SymbolTree(_UnboundVariableIdentifier)
+  symbol_tree.ingest_variable_binding(unbound_reference_name, None)
+  symbol_tree.update_payload_tracking_reference(
+      computation_building_blocks.Reference(
+          unbound_reference_name, computation_types.AbstractType('T')))
+
+  placement_removed, _ = transformation_utils.transform_postorder_with_symbol_bindings(
+      comp, _transform, symbol_tree)
+
+  unbound_reference_type = unbound_reference_type_container[0]
+  if not isinstance(unbound_reference_type, computation_types.FederatedType):
+    raise TypeError('The lone unbound reference is not of federated type; '
+                    'this is disallowed. '
+                    'The unbound type is {}'.format(unbound_reference_type))
+
+  ref_to_fed_arg = computation_building_blocks.Reference(
+      unbound_reference_name, unbound_reference_type)
+
+  lambda_wrapping_placement_removal = computation_building_blocks.Lambda(
+      unbound_reference_name, unbound_reference_type.member, placement_removed)
+
+  mapped = computation_constructing_utils.create_federated_map_or_apply(
+      lambda_wrapping_placement_removal, ref_to_fed_arg)
+
+  return mapped
 
 
 def _is_called_intrinsic(comp, uri=None):
